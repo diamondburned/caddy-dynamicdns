@@ -160,16 +160,16 @@ func (a App) checkerLoop() {
 func (a App) checkIPAndUpdateDNS() {
 	a.logger.Debug("beginning IP address check")
 
-	lastIPsMu.Lock()
-	defer lastIPsMu.Unlock()
+	lastIPDomainsMu.Lock()
+	defer lastIPDomainsMu.Unlock()
 
 	var err error
 
 	allDomains := a.allDomains()
 
 	// if we don't know current IPs for this domain, look them up from DNS
-	if lastIPs == nil {
-		lastIPs, err = a.lookupCurrentIPsFromDNS(allDomains)
+	if lastIPDomains == nil {
+		lastIPDomains, err = a.lookupCurrentIPsFromDNS(allDomains)
 		if err != nil {
 			// not the end of the world, but might be an extra initial API hit with the DNS provider
 			a.logger.Error("unable to lookup current IPs from DNS records", zap.Error(err))
@@ -196,20 +196,22 @@ func (a App) checkIPAndUpdateDNS() {
 
 	// do a simple diff of current and previous IPs to make DNS records to update
 	updatedRecsByZone := make(map[string][]libdns.Record)
-	for _, ip := range currentIPs {
-		if ipListContains(lastIPs, ip) && !ipListContains(lastIPs, nilIP) {
-			continue // IP is not different and no new domains to manage; no update needed
-		}
+	for zone, domains := range allDomains {
+		lastIPs := lastIPDomains[zone]
 
-		oldIPStrings := make([]string, len(lastIPs))
-		for i, val := range lastIPs {
-			oldIPStrings[i] = val.String()
-		}
-		a.logger.Info("different IP address",
-			zap.String("new_ip", ip.String()),
-			zap.Strings("old_ips", oldIPStrings))
+		for _, ip := range currentIPs {
+			if ipListContains(lastIPs, ip) && !ipListContains(lastIPs, nilIP) {
+				continue // IP is not different and no new domains to manage; no update needed
+			}
 
-		for zone, domains := range allDomains {
+			oldIPStrings := make([]string, len(lastIPs))
+			for i, val := range lastIPs {
+				oldIPStrings[i] = val.String()
+			}
+			a.logger.Info("different IP address",
+				zap.String("new_ip", ip.String()),
+				zap.Strings("old_ips", oldIPStrings))
+
 			for _, domain := range domains {
 				updatedRecsByZone[zone] = append(updatedRecsByZone[zone], libdns.Record{
 					Type:  recordType(ip),
@@ -252,16 +254,21 @@ func (a App) checkIPAndUpdateDNS() {
 	a.logger.Info("finished updating DNS",
 		zap.Strings("current_ips", currentIPStrings))
 
-	lastIPs = currentIPs
+	currentIPDomains := make(map[string][]net.IP, len(allDomains))
+	for zone := range allDomains {
+		currentIPDomains[zone] = currentIPs
+	}
+
+	lastIPDomains = currentIPDomains
 }
 
 // lookupCurrentIPsFromDNS looks up the current IP addresses
 // from DNS records.
-func (a App) lookupCurrentIPsFromDNS(domains map[string][]string) ([]net.IP, error) {
+func (a App) lookupCurrentIPsFromDNS(domains map[string][]string) (map[string][]net.IP, error) {
 	types := []string{recordTypeA, recordTypeAAAA}
 
 	// avoid duplicates
-	currentIPs := make(map[string]net.IP)
+	currentIPDomains := make(map[string]map[string]net.IP)
 
 	if recordGetter, ok := a.dnsProvider.(libdns.RecordGetter); ok {
 		for zone, names := range domains {
@@ -282,6 +289,13 @@ func (a App) lookupCurrentIPsFromDNS(domains map[string][]string) ([]net.IP, err
 					a.logger.Error("invalid IP address found in current DNS record", zap.String("A", r.Value))
 				}
 			}
+
+			currentIPs, ok := currentIPDomains[zone]
+			if !ok {
+				currentIPs = make(map[string]net.IP)
+				currentIPDomains[zone] = currentIPs
+			}
+
 			for _, n := range names {
 				for _, t := range types {
 					ip, ok := recMap[t+"|"+n]
@@ -297,12 +311,15 @@ func (a App) lookupCurrentIPsFromDNS(domains map[string][]string) ([]net.IP, err
 	}
 
 	// convert into a slice
-	ips := make([]net.IP, 0, len(currentIPs))
-	for _, ip := range currentIPs {
-		ips = append(ips, ip)
+	ipDomains := make(map[string][]net.IP, len(currentIPDomains))
+	for domain, ips := range currentIPDomains {
+		ipDomains[domain] = make([]net.IP, 0, len(ips))
+		for _, ip := range ips {
+			ipDomains[domain] = append(ipDomains[domain], ip)
+		}
 	}
 
-	return ips, nil
+	return ipDomains, nil
 }
 
 func (a App) lookupManagedDomains() ([]string, error) {
@@ -418,8 +435,8 @@ func (ip IPVersions) V6Enabled() bool {
 // time a new config is loaded; the IPs are
 // unlikely to change very often.
 var (
-	lastIPs   []net.IP
-	lastIPsMu sync.Mutex
+	lastIPDomains   map[string][]net.IP
+	lastIPDomainsMu sync.Mutex
 
 	// Special value indicate there is a new domain to manage.
 	nilIP net.IP
